@@ -85,7 +85,7 @@ paths:
       summary: List shipments with filters
       parameters:
         - { name: q, in: query, schema: { type: string }, description: "Free text: reference, container, invoice, tag, package, sales order, PO, customer, product" }
-        - { name: status, in: query, schema: { type: string }, description: "One status or a comma-separated list", example: in_transit,arrived }
+        - { name: status, in: query, schema: { type: string }, description: "One status or a comma-separated list", example: "in_transit,arrived" }
         - { name: shipping_method, in: query, schema: { $ref: '#/components/schemas/ShippingMethod' } }
         - { name: destination_port, in: query, schema: { type: string } }
         - { name: shipping_line, in: query, schema: { type: string } }
@@ -327,7 +327,7 @@ paths:
               properties:
                 customer_delivery_date: { type: string, format: date, nullable: true }
                 delivered_at: { type: string, format: date, nullable: true }
-                reason: { type: string, minLength: 3, example: Site not ready, customer asked for a later date }
+                reason: { type: string, minLength: 3, example: "Site not ready, customer asked for a later date" }
       responses:
         '200': { $ref: '#/components/responses/CargoItem' }
         '422': { $ref: '#/components/responses/ValidationError' }
@@ -799,7 +799,7 @@ components:
     ContainerFields:
       type: object
       properties:
-        container_no: { type: string, example: HLBU8324720, description: ISO 6346 number (sea/road) or air waybill number (air, e.g. 501-20079076) }
+        container_no: { type: string, example: HLBU8324720, description: "ISO 6346 number (sea/road) or air waybill number (air, e.g. 501-20079076)" }
         seal_no: { type: string, nullable: true }
         container_type: { type: string, nullable: true, example: 45UT }
         customs_cleared: { type: boolean }
@@ -840,11 +840,11 @@ components:
         unit: { type: string, default: PC }
         net_weight_kg: { type: number, nullable: true }
         gross_weight_kg: { type: number, nullable: true }
-        is_stock: { type: boolean, description: Stock item, not (yet) sold to a customer }
+        is_stock: { type: boolean, description: "Stock item, not (yet) sold to a customer" }
         certificate_sent: { type: boolean }
         comments: { type: string, nullable: true }
         customer_id: { type: integer, description: Either customer_id or customer_name }
-        customer_name: { type: string, description: Matched case-insensitively, created when unknown }
+        customer_name: { type: string, description: "Matched case-insensitively, created when unknown" }
         product_id: { type: integer, description: Either product_id or product }
         product:
           type: object
@@ -875,7 +875,7 @@ components:
         - $ref: '#/components/schemas/CargoItemFields'
         - type: object
           properties:
-            status: { $ref: '#/components/schemas/Status', description: delivered once delivered_at is set, otherwise the shipment's status }
+            status: { $ref: '#/components/schemas/Status', description: "delivered once delivered_at is set, otherwise the shipment's status" }
             status_label: { type: string }
             customer_delivery_date: { type: string, format: date, nullable: true, description: Agreed delivery date (audited) }
             delivered_at: { type: string, format: date, nullable: true, description: Actual delivery date (audited) }
@@ -940,7 +940,7 @@ components:
         level: { type: string, enum: [error, warning] }
         column: { type: string, nullable: true }
         message: { type: string }
-        raw: { type: object, nullable: true, description: Snapshot of the row (customer, invoice, container, tag, package, description, status) }
+        raw: { type: object, nullable: true, description: "Snapshot of the row (customer, invoice, container, tag, package, description, status)" }
 
     ImportRun:
       type: object
