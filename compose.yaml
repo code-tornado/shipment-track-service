@@ -1,0 +1,45 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: shipping
+      POSTGRES_USER: shipping
+      POSTGRES_PASSWORD: shipping
+    volumes:
+      - dbdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shipping -d shipping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      APP_NAME: "Shipment Tracking"
+      APP_ENV: local
+      APP_DEBUG: "false"
+      # Development key only; generate your own with `php artisan key:generate --show`.
+      APP_KEY: base64:gkEXGusO2a3p39LtiCqLRZgBU6R7NMvDbdj3EkdfUOc=
+      APP_URL: http://localhost:8000
+      LOG_CHANNEL: stderr
+      DB_CONNECTION: pgsql
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_DATABASE: shipping
+      DB_USERNAME: shipping
+      DB_PASSWORD: shipping
+      SESSION_DRIVER: file
+      CACHE_STORE: file
+      QUEUE_CONNECTION: sync
+      TRACKING_PROVIDER: manual
+      # Seeds the demo companies and imports database/seed/Norway_delivery_plan.xlsx (idempotent).
+      SEED_ON_START: "true"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  dbdata:

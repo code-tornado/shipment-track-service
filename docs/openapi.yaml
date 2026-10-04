@@ -1,0 +1,983 @@
+openapi: 3.0.3
+info:
+  title: Shipment Tracking Service API
+  version: 1.0.0
+  description: |
+    REST API of the shipment tracking microservice: the shipping leg of aquaculture
+    net orders from the factory in India to the customer's site in Norway.
+
+    * Every request is authenticated with a bearer token; the token belongs to a user of
+      one **company** and all data is separated per company.
+    * Suppli owns orders, invoices, tags and products; this service stores those fields as
+      read-only references (`proforma_invoice_no`, `exporter_ref`, `tag_no`, product, `storage_facility`).
+    * The service owns containers, seals, shipping method/line, destination, ETD/ETA/ATA,
+      status and customer delivery dates. Status changes keep a history, date changes an audit trail.
+
+    Status flow: `planned → in_transit → arrived → in_storage → delivered`
+    (`in_transit → in_storage` and `arrived → delivered` are allowed shortcuts).
+servers:
+  - url: /api/v1
+security:
+  - bearerAuth: []
+tags:
+  - name: Auth
+  - name: Shipments
+  - name: Containers
+  - name: Cargo items
+  - name: Lookup
+  - name: Reports
+  - name: Reference data
+    description: Customers and products mirrored from Suppli
+  - name: Import
+  - name: Webhooks
+    description: Outbound notifications (how Suppli learns about changes)
+
+paths:
+  /auth/token:
+    post:
+      tags: [Auth]
+      security: []
+      summary: Issue an API token for email + password
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email, example: demo@garware.example }
+                password: { type: string, example: password }
+                device_name: { type: string, example: suppli-integration }
+      responses:
+        '201':
+          description: Token issued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string, example: 3|xK9...plain-text-token }
+                  user: { $ref: '#/components/schemas/User' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+    delete:
+      tags: [Auth]
+      summary: Revoke the token used for this request
+      responses:
+        '200': { description: Revoked }
+  /auth/me:
+    get:
+      tags: [Auth]
+      summary: The authenticated user and company
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user: { $ref: '#/components/schemas/User' }
+
+  /shipments:
+    get:
+      tags: [Shipments]
+      summary: List shipments with filters
+      parameters:
+        - { name: q, in: query, schema: { type: string }, description: "Free text: reference, container, invoice, tag, package, sales order, PO, customer, product" }
+        - { name: status, in: query, schema: { type: string }, description: "One status or a comma-separated list", example: in_transit,arrived }
+        - { name: shipping_method, in: query, schema: { $ref: '#/components/schemas/ShippingMethod' } }
+        - { name: destination_port, in: query, schema: { type: string } }
+        - { name: shipping_line, in: query, schema: { type: string } }
+        - { name: container_no, in: query, schema: { type: string } }
+        - { name: proforma_invoice_no, in: query, schema: { type: string } }
+        - { name: tag_no, in: query, schema: { type: string } }
+        - { name: customer_id, in: query, schema: { type: integer } }
+        - { name: customer, in: query, schema: { type: string }, description: Customer name contains }
+        - { name: product, in: query, schema: { type: string }, description: Product description or material code contains }
+        - { name: etd_from, in: query, schema: { type: string, format: date } }
+        - { name: etd_to, in: query, schema: { type: string, format: date } }
+        - { name: eta_from, in: query, schema: { type: string, format: date } }
+        - { name: eta_to, in: query, schema: { type: string, format: date } }
+        - { name: delayed, in: query, schema: { type: boolean }, description: Only delayed shipments }
+        - { name: sort, in: query, schema: { type: string, default: -etd }, description: "etd, eta, ata, reference, status, destination_port, created_at; prefix with - for descending" }
+        - { name: page, in: query, schema: { type: integer } }
+        - { name: per_page, in: query, schema: { type: integer, default: 25, maximum: 200 } }
+      responses:
+        '200':
+          description: Paginated list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/ShipmentSummary' } }
+                  meta: { $ref: '#/components/schemas/PaginationMeta' }
+    post:
+      tags: [Shipments]
+      summary: Create a shipment, optionally with containers and cargo items
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ShipmentInput' }
+      responses:
+        '201': { $ref: '#/components/responses/Shipment' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /shipments/{id}:
+    parameters: [{ $ref: '#/components/parameters/id' }]
+    get:
+      tags: [Shipments]
+      summary: Shipment with containers, cargo items, status history and date changes
+      responses:
+        '200': { $ref: '#/components/responses/Shipment' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Shipments]
+      summary: Update descriptive fields (not status or dates)
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reference: { type: string }
+                shipping_method: { $ref: '#/components/schemas/ShippingMethod' }
+                shipping_line: { type: string, nullable: true }
+                origin_port: { type: string, nullable: true }
+                destination_port: { type: string }
+                incoterm: { type: string, nullable: true }
+                notes: { type: string, nullable: true }
+      responses:
+        '200': { $ref: '#/components/responses/Shipment' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+    delete:
+      tags: [Shipments]
+      summary: Delete a shipment and everything in it
+      responses:
+        '204': { description: Deleted }
+
+  /shipments/{id}/status:
+    parameters: [{ $ref: '#/components/parameters/id' }]
+    post:
+      tags: [Shipments]
+      summary: Move the shipment to the next status
+      description: |
+        Only transitions allowed by the flow are accepted (`allowed_transitions` on the shipment
+        lists them). `arrived` sets the actual arrival date if empty, `in_storage` stamps the
+        storage date on containers, `delivered` marks every remaining cargo item delivered.
+        Every change is written to the status history with actor, time and note.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: { $ref: '#/components/schemas/Status' }
+                note: { type: string, nullable: true, example: Discharged at Bergen }
+                occurred_at: { type: string, format: date, nullable: true, description: When it happened (default now) }
+      responses:
+        '200': { $ref: '#/components/responses/Shipment' }
+        '422':
+          description: Transition not allowed or validation error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example: { message: "Cannot change status from in_transit to delivered. Allowed: arrived, in_storage.", errors: { status: ["Transition not allowed."] } }
+
+  /shipments/{id}/dates:
+    parameters: [{ $ref: '#/components/parameters/id' }]
+    patch:
+      tags: [Shipments]
+      summary: Change ETD / ETA / actual arrival (audited)
+      description: |
+        Each changed field produces an audit row (old value, new value, who, when, reason).
+        `customer_delivery_date` is applied to every cargo item of the shipment that is not delivered yet.
+        ETA and actual arrival must not be before ETD.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                etd: { type: string, format: date }
+                eta: { type: string, format: date }
+                ata: { type: string, format: date, nullable: true }
+                customer_delivery_date: { type: string, format: date, nullable: true }
+                reason: { type: string, minLength: 3, example: Vessel rerouted via Rotterdam }
+      responses:
+        '200': { $ref: '#/components/responses/Shipment' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /shipments/{id}/history:
+    parameters: [{ $ref: '#/components/parameters/id' }]
+    get:
+      tags: [Shipments]
+      summary: Timeline of status changes and date changes (shipment and its cargo items), newest first
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      oneOf:
+                        - $ref: '#/components/schemas/StatusHistoryEntry'
+                        - $ref: '#/components/schemas/DateChangeEntry'
+
+  /shipments/{id}/containers:
+    parameters: [{ $ref: '#/components/parameters/id' }]
+    post:
+      tags: [Containers]
+      summary: Add a container (optionally with cargo items) to a shipment
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ContainerInput' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: '#/components/schemas/Container' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /containers/{id}:
+    parameters: [{ $ref: '#/components/parameters/id' }]
+    patch:
+      tags: [Containers]
+      summary: Update a container
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ContainerFields' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: '#/components/schemas/Container' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+    delete:
+      tags: [Containers]
+      summary: Delete a container and its cargo items
+      responses:
+        '204': { description: Deleted }
+
+  /containers/{id}/cargo-items:
+    parameters: [{ $ref: '#/components/parameters/id' }]
+    post:
+      tags: [Cargo items]
+      summary: Add a cargo item (a tagged net, panel or bundle) to a container
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CargoItemInput' }
+      responses:
+        '201': { $ref: '#/components/responses/CargoItem' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /cargo-items/{id}:
+    parameters: [{ $ref: '#/components/parameters/id' }]
+    patch:
+      tags: [Cargo items]
+      summary: Update a cargo item's reference fields (dates go through /dates)
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CargoItemFields' }
+      responses:
+        '200': { $ref: '#/components/responses/CargoItem' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+    delete:
+      tags: [Cargo items]
+      summary: Delete a cargo item
+      responses:
+        '204': { description: Deleted }
+
+  /cargo-items/{id}/dates:
+    parameters: [{ $ref: '#/components/parameters/id' }]
+    patch:
+      tags: [Cargo items]
+      summary: Change the agreed customer delivery date and/or the actual delivery date (audited)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                customer_delivery_date: { type: string, format: date, nullable: true }
+                delivered_at: { type: string, format: date, nullable: true }
+                reason: { type: string, minLength: 3, example: Site not ready, customer asked for a later date }
+      responses:
+        '200': { $ref: '#/components/responses/CargoItem' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /lookup:
+    get:
+      tags: [Lookup]
+      summary: Find shipments and cargo by container no, proforma invoice, tag, product or customer
+      parameters:
+        - { name: q, in: query, required: true, schema: { type: string, minLength: 2 }, example: HLBU8324720 }
+        - { name: type, in: query, schema: { type: string, enum: [all, container, invoice, tag, product, customer], default: all } }
+        - { name: limit, in: query, schema: { type: integer, default: 200, maximum: 500 } }
+      responses:
+        '200':
+          description: Matches, grouped by what matched, plus the distinct shipments involved
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  query: { type: string }
+                  type: { type: string }
+                  shipments: { type: array, items: { $ref: '#/components/schemas/ShipmentSummary' } }
+                  containers: { type: array, items: { $ref: '#/components/schemas/Container' } }
+                  cargo_items: { type: array, items: { $ref: '#/components/schemas/CargoItem' } }
+
+  /reports/upcoming-deliveries:
+    get:
+      tags: [Reports]
+      summary: Customer deliveries due in a date range, plus arrivals at port in the same range
+      parameters:
+        - { name: from, in: query, schema: { type: string, format: date }, description: Default today }
+        - { name: to, in: query, schema: { type: string, format: date }, description: Default from + 14 days }
+        - { name: customer_id, in: query, schema: { type: integer } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  from: { type: string, format: date }
+                  to: { type: string, format: date }
+                  totals: { type: object, properties: { deliveries: { type: integer }, arrivals: { type: integer } } }
+                  deliveries: { type: array, items: { $ref: '#/components/schemas/CargoItem' } }
+                  arrivals: { type: array, items: { $ref: '#/components/schemas/ShipmentSummary' } }
+
+  /reports/status-overview:
+    get:
+      tags: [Reports]
+      summary: Counts of shipments, containers and cargo items per status, per customer, and key figures
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  as_of: { type: string, format: date }
+                  statuses: { type: array, items: { type: object, properties: { value: { $ref: '#/components/schemas/Status' }, label: { type: string } } } }
+                  by_status:
+                    type: object
+                    properties:
+                      shipments: { $ref: '#/components/schemas/StatusCounts' }
+                      containers: { $ref: '#/components/schemas/StatusCounts' }
+                      cargo_items: { $ref: '#/components/schemas/StatusCounts' }
+                  by_customer:
+                    type: array
+                    items:
+                      allOf:
+                        - type: object
+                          properties: { customer: { type: string }, cargo_items: { type: integer } }
+                        - $ref: '#/components/schemas/StatusCounts'
+                  highlights:
+                    type: object
+                    properties:
+                      shipments_total: { type: integer }
+                      shipments_delayed: { type: integer }
+                      shipments_in_transit: { type: integer }
+                      arriving_next_7_days: { type: integer }
+                      cargo_items_in_storage: { type: integer }
+                      deliveries_next_7_days: { type: integer }
+                      deliveries_late: { type: integer }
+
+  /reports/delayed:
+    get:
+      tags: [Reports]
+      summary: Delayed shipments (arrived late or overdue at sea) and late customer deliveries
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  as_of: { type: string, format: date }
+                  totals: { type: object, properties: { shipments: { type: integer }, cargo_items: { type: integer } } }
+                  shipments: { type: array, items: { $ref: '#/components/schemas/ShipmentSummary' } }
+                  cargo_items: { type: array, items: { $ref: '#/components/schemas/CargoItem' } }
+
+  /customers:
+    get:
+      tags: [Reference data]
+      summary: Customers known to this company
+      parameters: [{ name: q, in: query, schema: { type: string } }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/Customer' } }
+    put:
+      tags: [Reference data]
+      summary: Create or update a customer (matched by suppli_ref, then by name)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, example: Fisk AS West }
+                suppli_ref: { type: string, nullable: true, example: CUST-1042 }
+      responses:
+        '200': { description: Updated }
+        '201': { description: Created }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /products:
+    get:
+      tags: [Reference data]
+      summary: Products known to this company
+      parameters: [{ name: q, in: query, schema: { type: string } }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/Product' } }
+    put:
+      tags: [Reference data]
+      summary: Create or update a product (matched by material_code, then by description)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [description]
+              properties:
+                material_code: { type: string, nullable: true, example: '25403000658' }
+                description: { type: string, example: NP-164mCx1.3+18+16m/KNXPlus/540p-29HM/O1 }
+                net_type: { $ref: '#/components/schemas/NetType' }
+      responses:
+        '200': { description: Updated }
+        '201': { description: Created }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /imports:
+    get:
+      tags: [Import]
+      summary: Previous import runs
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/ImportRun' } }
+    post:
+      tags: [Import]
+      summary: Import a delivery plan spreadsheet (.xlsx)
+      description: |
+        One row per cargo item. Rows are grouped into containers (by container number) and
+        shipments (by sailing: method, line, port, ETD, planned ETA). Rows that cannot be
+        imported are reported as `error` issues with the row number; rows that needed
+        normalisation are imported with a `warning`. Rows whose package number already exists
+        are skipped, so re-importing a file is safe.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary }
+      responses:
+        '201':
+          description: Import finished (see issues for skipped rows)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: '#/components/schemas/ImportRun' }
+        '422':
+          description: The file could not be processed at all (not a spreadsheet, header row missing)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: '#/components/schemas/ImportRun' }
+
+  /imports/{id}:
+    parameters: [{ $ref: '#/components/parameters/id' }]
+    get:
+      tags: [Import]
+      summary: An import run with all its issues
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: '#/components/schemas/ImportRun' }
+
+  /webhooks:
+    get:
+      tags: [Webhooks]
+      summary: Registered endpoints
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/WebhookEndpoint' } }
+    post:
+      tags: [Webhooks]
+      summary: Register an endpoint that receives status and date change events
+      description: |
+        Each delivery is a JSON POST with headers `X-Webhook-Event`, `X-Webhook-Delivery` and
+        `X-Webhook-Signature: sha256=<HMAC-SHA256 of the raw body with the endpoint secret>`.
+        Failed deliveries are retried with back-off (30 s, 2 min, 10 min, 1 h).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url]
+              properties:
+                url: { type: string, format: uri, example: https://suppli.example/hooks/shipping }
+                secret: { type: string, minLength: 16, description: Generated when omitted; returned once }
+                events:
+                  type: array
+                  items: { type: string, enum: ['*', shipment.status_changed, shipment.dates_changed, cargo_item.dates_changed] }
+                  default: ['*']
+                active: { type: boolean, default: true }
+      responses:
+        '201':
+          description: Created (includes the secret, shown only once)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    allOf:
+                      - $ref: '#/components/schemas/WebhookEndpoint'
+                      - type: object
+                        properties: { secret: { type: string } }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /webhooks/{id}:
+    parameters: [{ $ref: '#/components/parameters/id' }]
+    delete:
+      tags: [Webhooks]
+      summary: Remove an endpoint
+      responses:
+        '204': { description: Deleted }
+
+  /webhooks/{id}/deliveries:
+    parameters: [{ $ref: '#/components/parameters/id' }]
+    get:
+      tags: [Webhooks]
+      summary: Last 100 deliveries to an endpoint, with payloads and results
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/WebhookDelivery' } }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: "Sanctum personal access token, e.g. `Authorization: Bearer 1|demo-token-garware`"
+
+  parameters:
+    id:
+      name: id
+      in: path
+      required: true
+      schema: { type: integer }
+
+  responses:
+    Shipment:
+      description: Shipment
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              data: { $ref: '#/components/schemas/Shipment' }
+    CargoItem:
+      description: Cargo item
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              data: { $ref: '#/components/schemas/CargoItem' }
+    ValidationError:
+      description: Validation failed
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          example: { message: "The containers.0.container_no field must be a valid ISO 6346 container number (e.g. HLBU8324720).", errors: { "containers.0.container_no": ["The containers.0.container_no must be a valid ISO 6346 container number (e.g. HLBU8324720)."] } }
+    NotFound:
+      description: Not found (or belongs to another company)
+
+  schemas:
+    Status:
+      type: string
+      enum: [planned, in_transit, arrived, in_storage, delivered]
+    ShippingMethod:
+      type: string
+      enum: [sea, air, road]
+    NetType:
+      type: string
+      enum: [net_pen, dead_fish_collector, lice_shield, repair_panel, velcro_straps, rope, bird_net, other]
+      description: "net_pen = NP, dead_fish_collector = DF on the packing slip"
+    ChangeSource:
+      type: string
+      enum: [user, import, provider, system]
+
+    ErrorResponse:
+      type: object
+      properties:
+        message: { type: string }
+        errors:
+          type: object
+          additionalProperties: { type: array, items: { type: string } }
+
+    PaginationMeta:
+      type: object
+      properties:
+        current_page: { type: integer }
+        last_page: { type: integer }
+        per_page: { type: integer }
+        total: { type: integer }
+        from: { type: integer, nullable: true }
+        to: { type: integer, nullable: true }
+
+    StatusCounts:
+      type: object
+      properties:
+        planned: { type: integer }
+        in_transit: { type: integer }
+        arrived: { type: integer }
+        in_storage: { type: integer }
+        delivered: { type: integer }
+
+    User:
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        email: { type: string }
+        company:
+          type: object
+          properties:
+            id: { type: integer }
+            name: { type: string }
+            slug: { type: string }
+
+    Customer:
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        suppli_ref: { type: string, nullable: true }
+        cargo_items_count: { type: integer }
+
+    Product:
+      type: object
+      properties:
+        id: { type: integer }
+        material_code: { type: string, nullable: true }
+        description: { type: string }
+        net_type: { $ref: '#/components/schemas/NetType' }
+        net_type_label: { type: string }
+        cargo_items_count: { type: integer }
+
+    ShipmentRef:
+      type: object
+      properties:
+        id: { type: integer }
+        reference: { type: string }
+        status: { $ref: '#/components/schemas/Status' }
+        status_label: { type: string }
+        etd: { type: string, format: date }
+        eta: { type: string, format: date }
+        ata: { type: string, format: date, nullable: true }
+        destination_port: { type: string }
+
+    ShipmentSummary:
+      type: object
+      properties:
+        id: { type: integer }
+        reference: { type: string, example: SHP-2026-0012 }
+        status: { $ref: '#/components/schemas/Status' }
+        status_label: { type: string }
+        allowed_transitions: { type: array, items: { $ref: '#/components/schemas/Status' } }
+        shipping_method: { $ref: '#/components/schemas/ShippingMethod' }
+        shipping_line: { type: string, nullable: true, example: TRANSSEA AS }
+        origin_port: { type: string, nullable: true }
+        destination_port: { type: string, example: BERGEN }
+        incoterm: { type: string, nullable: true, example: CIF }
+        etd: { type: string, format: date }
+        eta: { type: string, format: date, description: Planned / current estimated arrival }
+        ata: { type: string, format: date, nullable: true, description: Actual arrival }
+        days_delayed: { type: integer, description: "Arrived: ata − eta. Not arrived: today − eta once the ETA has passed. Never negative." }
+        is_delayed: { type: boolean }
+        status_changed_at: { type: string, format: date-time, nullable: true }
+        notes: { type: string, nullable: true }
+        containers_count: { type: integer }
+        container_nos: { type: array, items: { type: string } }
+        cargo_items_count: { type: integer }
+        delivered_items_count: { type: integer }
+        customers: { type: array, items: { type: string } }
+        proforma_invoice_nos: { type: array, items: { type: string } }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    Shipment:
+      allOf:
+        - $ref: '#/components/schemas/ShipmentSummary'
+        - type: object
+          properties:
+            containers: { type: array, items: { $ref: '#/components/schemas/Container' } }
+            status_history: { type: array, items: { $ref: '#/components/schemas/StatusHistoryEntry' } }
+            date_changes: { type: array, items: { $ref: '#/components/schemas/DateChangeEntry' } }
+
+    ContainerFields:
+      type: object
+      properties:
+        container_no: { type: string, example: HLBU8324720, description: ISO 6346 number (sea/road) or air waybill number (air, e.g. 501-20079076) }
+        seal_no: { type: string, nullable: true }
+        container_type: { type: string, nullable: true, example: 45UT }
+        customs_cleared: { type: boolean }
+        storage_facility: { type: string, nullable: true, example: Warehouse Måløy, description: Suppli reference }
+        storage_date: { type: string, format: date, nullable: true }
+        pickup_date: { type: string, format: date, nullable: true }
+
+    ContainerInput:
+      allOf:
+        - $ref: '#/components/schemas/ContainerFields'
+        - type: object
+          required: [container_no]
+          properties:
+            cargo_items: { type: array, items: { $ref: '#/components/schemas/CargoItemInput' } }
+
+    Container:
+      allOf:
+        - type: object
+          properties:
+            id: { type: integer }
+            shipment_id: { type: integer }
+        - $ref: '#/components/schemas/ContainerFields'
+        - type: object
+          properties:
+            cargo_items_count: { type: integer }
+            cargo_items: { type: array, items: { $ref: '#/components/schemas/CargoItem' } }
+            shipment: { $ref: '#/components/schemas/ShipmentRef' }
+
+    CargoItemFields:
+      type: object
+      properties:
+        proforma_invoice_no: { type: string, example: '862600578', description: Suppli reference }
+        exporter_ref: { type: string, nullable: true, example: '462600297', description: "Exporter's reference / sales order no (Suppli)" }
+        customer_po: { type: string, nullable: true }
+        tag_no: { type: string, nullable: true, example: GNP-2608002, description: "Normalised to PREFIX-NUMBER; a net pen and its dead fish collector may share a tag" }
+        package_no: { type: string, nullable: true, example: WENA193722, description: Package / batch number from the packing slip; unique per company }
+        quantity: { type: integer, minimum: 1, default: 1 }
+        unit: { type: string, default: PC }
+        net_weight_kg: { type: number, nullable: true }
+        gross_weight_kg: { type: number, nullable: true }
+        is_stock: { type: boolean, description: Stock item, not (yet) sold to a customer }
+        certificate_sent: { type: boolean }
+        comments: { type: string, nullable: true }
+        customer_id: { type: integer, description: Either customer_id or customer_name }
+        customer_name: { type: string, description: Matched case-insensitively, created when unknown }
+        product_id: { type: integer, description: Either product_id or product }
+        product:
+          type: object
+          properties:
+            material_code: { type: string, nullable: true }
+            description: { type: string }
+            net_type: { $ref: '#/components/schemas/NetType' }
+
+    CargoItemInput:
+      allOf:
+        - $ref: '#/components/schemas/CargoItemFields'
+        - type: object
+          required: [proforma_invoice_no]
+          properties:
+            customer_delivery_date: { type: string, format: date, nullable: true }
+            delivered_at: { type: string, format: date, nullable: true }
+
+    CargoItem:
+      allOf:
+        - type: object
+          properties:
+            id: { type: integer }
+            container_id: { type: integer }
+            container_no: { type: string }
+            shipment: { $ref: '#/components/schemas/ShipmentRef' }
+            customer: { type: object, properties: { id: { type: integer }, name: { type: string } } }
+            product: { $ref: '#/components/schemas/Product' }
+        - $ref: '#/components/schemas/CargoItemFields'
+        - type: object
+          properties:
+            status: { $ref: '#/components/schemas/Status', description: delivered once delivered_at is set, otherwise the shipment's status }
+            status_label: { type: string }
+            customer_delivery_date: { type: string, format: date, nullable: true, description: Agreed delivery date (audited) }
+            delivered_at: { type: string, format: date, nullable: true, description: Actual delivery date (audited) }
+            days_delayed: { type: integer, nullable: true, description: "delivered_at − customer_delivery_date, or today − customer_delivery_date while overdue; null without an agreed date" }
+
+    ShipmentInput:
+      type: object
+      required: [shipping_method, destination_port, etd, eta]
+      properties:
+        reference: { type: string, description: Generated (SHP-YYYY-NNNN) when omitted }
+        status: { $ref: '#/components/schemas/Status' }
+        status_note: { type: string }
+        shipping_method: { $ref: '#/components/schemas/ShippingMethod' }
+        shipping_line: { type: string, nullable: true }
+        origin_port: { type: string, nullable: true }
+        destination_port: { type: string }
+        incoterm: { type: string, nullable: true }
+        etd: { type: string, format: date }
+        eta: { type: string, format: date, description: Must be on or after ETD }
+        ata: { type: string, format: date, nullable: true }
+        notes: { type: string, nullable: true }
+        containers: { type: array, items: { $ref: '#/components/schemas/ContainerInput' } }
+
+    StatusHistoryEntry:
+      type: object
+      properties:
+        id: { type: integer }
+        type: { type: string, enum: [status] }
+        shipment_id: { type: integer }
+        from: { $ref: '#/components/schemas/Status' }
+        from_label: { type: string, nullable: true }
+        to: { $ref: '#/components/schemas/Status' }
+        to_label: { type: string }
+        note: { type: string, nullable: true }
+        source: { $ref: '#/components/schemas/ChangeSource' }
+        actor: { type: string, example: Tom Andersen }
+        occurred_at: { type: string, format: date-time }
+
+    DateChangeEntry:
+      type: object
+      properties:
+        id: { type: integer }
+        type: { type: string, enum: [date] }
+        subject_type: { type: string, enum: [shipment, cargo_item] }
+        subject_id: { type: integer }
+        subject_label: { type: string, nullable: true, description: Tag or package number for cargo items }
+        field: { type: string, enum: [etd, eta, ata, customer_delivery_date, delivered_at] }
+        field_label: { type: string }
+        old: { type: string, format: date, nullable: true }
+        new: { type: string, format: date, nullable: true }
+        days_shifted: { type: integer, nullable: true }
+        reason: { type: string }
+        source: { $ref: '#/components/schemas/ChangeSource' }
+        actor: { type: string }
+        occurred_at: { type: string, format: date-time }
+
+    ImportIssue:
+      type: object
+      properties:
+        id: { type: integer }
+        row_number: { type: integer, description: Excel row number }
+        level: { type: string, enum: [error, warning] }
+        column: { type: string, nullable: true }
+        message: { type: string }
+        raw: { type: object, nullable: true, description: Snapshot of the row (customer, invoice, container, tag, package, description, status) }
+
+    ImportRun:
+      type: object
+      properties:
+        id: { type: integer }
+        filename: { type: string }
+        status: { type: string, enum: [running, completed, failed] }
+        rows_total: { type: integer }
+        rows_imported: { type: integer }
+        rows_skipped: { type: integer }
+        warnings_count: { type: integer }
+        shipments_created: { type: integer }
+        containers_created: { type: integer }
+        cargo_items_created: { type: integer }
+        error: { type: string, nullable: true }
+        started_at: { type: string, format: date-time }
+        finished_at: { type: string, format: date-time, nullable: true }
+        user: { type: string, nullable: true }
+        issues: { type: array, items: { $ref: '#/components/schemas/ImportIssue' } }
+
+    WebhookEndpoint:
+      type: object
+      properties:
+        id: { type: integer }
+        url: { type: string }
+        events: { type: array, items: { type: string } }
+        active: { type: boolean }
+        deliveries_count: { type: integer, nullable: true }
+        created_at: { type: string, format: date-time }
+
+    WebhookDelivery:
+      type: object
+      properties:
+        id: { type: integer }
+        event: { type: string }
+        status: { type: string, enum: [pending, sent, failed] }
+        response_code: { type: integer, nullable: true }
+        attempts: { type: integer }
+        last_attempt_at: { type: string, format: date-time, nullable: true }
+        payload: { type: object }
